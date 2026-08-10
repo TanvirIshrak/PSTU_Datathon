@@ -1,0 +1,13 @@
+=== per-object-column details ===
+feat_142 | unique=1741 | nan=0
+  sample: ['PRD_00490', 'PRD_01543', 'PRD_00541', 'PRD_00409', 'PRD_02394', 'PRD_02131', 'PRD_01220', 'PRD_01599', 'PRD_00027', 'PRD_01601', 'PRD_00508', 'PRD_02421', 'PRD_01555', 'PRD_02136', 'PRD_02417']
+feat_157 | unique=555 | nan=0
+  sample: ['PRV_294', 'PRV_035', 'PRV_356', 'PRV_564', 'PRV_106', 'PRV_093', 'PRV_108', 'PRV_334', 'PRV_530', 'PRV_274', 'PRV_531', 'PRV_233', 'PRV_152', 'PRV_200', 'PRV_511']
+feat_318 | unique=12 | nan=0
+  sample: ['PERF_02', 'PERF_08', 'PERF_10', 'PERF_03', 'PERF_06', 'PERF_11', 'PERF_09', 'PERF_07', 'PERF_04', 'PERF_05', 'PERF_00', 'PERF_01']
+feat_320 | unique=115 | nan=0
+  sample: ['CH_060', 'CH_069', 'CH_019', 'CH_119', 'CH_100', 'CH_096', 'CH_001', 'CH_053', 'CH_079', 'CH_074', 'CH_081', 'CH_028', 'CH_049', 'CH_010', 'CH_065']
+feat_325 | unique=1389 | nan=0
+  sample: ['SEG_0327', 'SEG_0778', 'SEG_1054', 'SEG_1185', 'SEG_1240', 'SEG_1386', 'SEG_0382', 'SEG_0735', 'SEG_0688', 'SEG_0808', 'SEG_1023', 'SEG_1602', 'SEG_1654', 'SEG_0307', 'SEG_0129']
+feat_337 | unique=38 | nan=0
+  sample: ['OFC_39', 'OFC_08', 'OFC_14', 'OFC_03', 'OFC_04', 'OFC_01', 'OFC_24', 'OFC_37', 'OFC_18', 'OFC_12', 'OFC_06', 'OFC_05', 'OFC_02', 'OFC_09', 'OFC_34']

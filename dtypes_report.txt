@@ -1,0 +1,12 @@
+=== dtypes value_counts ===
+int64      213
+float64    132
+object       6
+Name: count, dtype: int64
+
+=== Object columns ===
+count: 6
+first 10: ['feat_142', 'feat_157', 'feat_318', 'feat_320', 'feat_325', 'feat_337']
+
+=== All non-numeric column samples ===
+feat_318 | unique=12 | nan=0 | sample=['PERF_02', 'PERF_08', 'PERF_10', 'PERF_03', 'PERF_06', 'PERF_11', 'PERF_09', 'PERF_07']

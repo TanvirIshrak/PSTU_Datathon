@@ -1,0 +1,47 @@
+﻿train: (4000, 351) test: (4000, 351) sample: (60654, 2)
+Python: 3.10.7 | Torch: 2.5.1+cu121 | Device: cuda
+  cell  3: OK
+d:\DS\kaggle\PSTU_Datathon\train.csv  exists=True
+d:\DS\kaggle\PSTU_Datathon\test.csv  exists=True
+d:\DS\kaggle\PSTU_Datathon\sample_submission.csv  exists=True
+train: (76020, 351)  test: (60654, 351)  sample_sub: (60654, 2)
+Has "id" in train? False  | test? True
+  cell  5: OK
+#feature columns: 350
+Target distribution:
+TARGET
+0    73012
+1     3008
+Name: count, dtype: int64
+Class balance: 0 = 96.04%, 1 = 3.96%
+  cell  7: OK
+Train ù top 10 missing (%):
+feat_350    0.0
+feat_1      0.0
+feat_2      0.0
+feat_3      0.0
+feat_4      0.0
+feat_5      0.0
+feat_6      0.0
+feat_7      0.0
+feat_8      0.0
+feat_9      0.0
+dtype: float64
+Test  ù top 10 missing (%):
+feat_350    0.0
+feat_1      0.0
+feat_2      0.0
+feat_3      0.0
+feat_4      0.0
+feat_5      0.0
+feat_6      0.0
+feat_7      0.0
+feat_8      0.0
+feat_9      0.0
+dtype: float64
+
+#features with NaN in train: 0, all-NaN: 0
+#features with NaN in test:  0, all-NaN: 0
+  cell  8: OK
+  cell  9: ERROR -> UnicodeEncodeError: 'charmap' codec can't encode character '\u2264' in position 28: character maps to <undefined>
+    Source snippet: # 3.3 Near-constant / constant features nunique = train[feat_cols].nunique() const_cols = nunique[nunique <= 1].index.tolist() dominant = [] for c in feat_cols:

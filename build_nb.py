@@ -1,0 +1,846 @@
+"""Build the new notebook.ipynb with maximum-accuracy pipeline."""
+import json
+from pathlib import Path
+
+NB_PATH = Path(r'd:\DS\kaggle\PSTU_Datathon\notebook.ipynb')
+
+
+def md(*lines):
+    return {
+        "cell_type": "markdown",
+        "metadata": {"language": "markdown"},
+        "source": [l if l.endswith("\n") else l + "\n" for l in lines],
+    }
+
+
+def code(*lines):
+    return {
+        "cell_type": "code",
+        "metadata": {"language": "python"},
+        "source": [l if l.endswith("\n") else l + "\n" for l in lines],
+        "outputs": [],
+    }
+
+
+cells = []
+
+# ---------- Title ----------
+cells.append(md(
+    "# PSTU DataThon 2026 Vol 1 — Account Instability Prediction",
+    "",
+    "**Competition:** Predict the probability that an account will be flagged as at-risk.",
+    "",
+    "- **Train:** ~60.6k rows × 350 anonymized numerical features (`feat_1` … `feat_350`) + `TARGET` (0/1)",
+    "- **Test:** ~75.8k rows + extra `id` column (last column, not present in train)",
+    "- **Metric:** Macro F1; convert probabilities to binary at the optimized threshold.",
+    "- **Constraints:** No external datasets. Pre-trained models permitted with disclosure. Data augmentation on training data only is allowed. ANNs / RNNs may be used.",
+    "",
+    "## Strategy for Highest Accuracy",
+    "",
+    "1. **EDA + robust preprocessing** — handle NaNs, drop near-constant columns, clip extreme outliers, keep a separate *imputed + scaled* matrix for the neural models.",
+    "2. **8 base learners** trained with Stratified 5-Fold CV:",
+    "   - LightGBM × 3 seeds (bagged)",
+    "   - XGBoost × 3 seeds (bagged)",
+    "   - CatBoost × 3 seeds (bagged)",
+    "   - HistGradientBoosting × 1 seed",
+    "   - ExtraTrees × 1 seed",
+    "   - RandomForest × 1 seed",
+    "   - Logistic Regression × 1 seed (linear baseline)",
+    "   - **MLP (ANN)** × 1 seed, 50 epochs × 5 folds with early stopping + SWA",
+    "   - **Deep MLP / 1-D CNN (RNN-like)** over feature embedding tokens, 50 epochs × 5 folds with early stopping + SWA",
+    "3. **Macro F1 threshold tuning** on OOF probabilities per model (and per fold for stability).",
+    "4. **Rank-average ensemble** of all base learners, then a **stacked Logistic Regression meta-learner** trained on OOF probabilities.",
+    "5. **Final submission** ordered like `sample_submission.csv` with the meta-learner probability + tuned threshold.",
+    "",
+    "**Reproducibility:** every random source is seeded (`SEED`); transformations fit only on train fold; test is transformed with the train-fold statistics.",
+))
+
+# ---------- 1. Imports ----------
+cells.append(md("## 1. Imports & Configuration"))
+cells.append(code(
+    "import os, gc, json, time, math, warnings, itertools",
+    "warnings.filterwarnings('ignore')",
+    "",
+    "import numpy as np",
+    "import pandas as pd",
+    "pd.set_option('display.max_columns', 100)",
+    "pd.set_option('display.width', 200)",
+    "",
+    "import matplotlib.pyplot as plt",
+    "import seaborn as sns",
+    "",
+    "from sklearn.model_selection import StratifiedKFold",
+    "from sklearn.metrics import f1_score, roc_auc_score, classification_report, confusion_matrix",
+    "from sklearn.preprocessing import StandardScaler, QuantileTransformer",
+    "from sklearn.ensemble import HistGradientBoostingClassifier, ExtraTreesClassifier, RandomForestClassifier",
+    "from sklearn.linear_model import LogisticRegression",
+    "from sklearn.impute import SimpleImputer",
+    "",
+    "import torch",
+    "import torch.nn as nn",
+    "import torch.nn.functional as F",
+    "from torch.utils.data import DataLoader, TensorDataset",
+    "from torch.optim.swa_utils import AveragedModel, SWALR",
+    "",
+    "import lightgbm as lgb",
+    "import xgboost as xgb",
+    "from catboost import CatBoostClassifier",
+    "",
+    "SEED = 42",
+    "N_SPLITS = 5",
+    "SEEDS = [42, 1024, 2025]            # 3 seeds for bagging the GBDT models",
+    "EPOCHS_ANN = 50                      # fixed 50 epochs × 5 folds (as requested)",
+    "BATCH_ANN = 2048",
+    "DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'",
+    "",
+    "def set_seed(seed=SEED):",
+    "    import random",
+    "    random.seed(seed); np.random.seed(seed)",
+    "    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)",
+    "    torch.backends.cudnn.benchmark = False",
+    "    torch.backends.cudnn.deterministic = True",
+    "set_seed(SEED)",
+    "",
+    "print(f'Python: {__import__(\"sys\").version.split()[0]} | Torch: {torch.__version__} | Device: {DEVICE}')",
+))
+
+# ---------- 2. Paths + Load ----------
+cells.append(md("## 2. Paths & Data Loading"))
+cells.append(code(
+    "if os.path.exists('/kaggle/input'):",
+    "    DATA_DIR = '/kaggle/input/pstu-data-thon-2026-vol-1'",
+    "else:",
+    "    DATA_DIR = r'd:\\DS\\kaggle\\PSTU_Datathon'",
+    "",
+    "TRAIN_PATH = os.path.join(DATA_DIR, 'train.csv')",
+    "TEST_PATH  = os.path.join(DATA_DIR, 'test.csv')",
+    "SAMPLE_SUB_PATH = os.path.join(DATA_DIR, 'sample_submission.csv')",
+    "OUT_DIR = '/kaggle/working' if os.path.exists('/kaggle') else DATA_DIR",
+    "",
+    "for p in [TRAIN_PATH, TEST_PATH, SAMPLE_SUB_PATH]:",
+    "    print(f'{p}  exists={os.path.exists(p)}')",
+    "",
+    "train = pd.read_csv(TRAIN_PATH)",
+    "test  = pd.read_csv(TEST_PATH)",
+    "sample_sub = pd.read_csv(SAMPLE_SUB_PATH)",
+    "print(f'train: {train.shape}  test: {test.shape}  sample_sub: {sample_sub.shape}')",
+    "print(f'Has \"id\" in train? {\"id\" in train.columns}  | test? {\"id\" in test.columns}')",
+    "train.head(3)",
+))
+
+# ---------- 2.1 Detect & encode object (categorical) columns ----------
+cells.append(code(
+    "# Some anonymized features are categorical strings (e.g. PRD_00593, PERF_02).",
+    "# We LabelEncode them in-place so all downstream code can treat them as numeric.",
+    "# CatBoost gets the original (now-integer) categorical info via the `cat_features` argument.",
+    "obj_cols = [c for c in train.columns if c.startswith('feat_') and train[c].dtype == object]",
+    "print(f'#object-typed feature columns: {len(obj_cols)}  -> {obj_cols}')",
+    "for c in obj_cols:",
+    "    n_tr = train[c].nunique(dropna=True); n_te = test[c].nunique(dropna=True) if c in test.columns else 0",
+    "    print(f'  {c}: train_unique={n_tr}, test_unique={n_te}')",
+    "",
+    "from sklearn.preprocessing import LabelEncoder",
+    "cat_maps = {}",
+    "for c in obj_cols:",
+    "    # Combine values from train and test so unseen-test categories are still in the mapping",
+    "    combined = pd.concat([train[c].astype(str), test[c].astype(str)], axis=0).fillna('__NAN__')",
+    "    le = LabelEncoder().fit(combined)",
+    "    train[c] = le.transform(train[c].astype(str).fillna('__NAN__'))",
+    "    test[c]  = le.transform(test[c].astype(str).fillna('__NAN__'))",
+    "    cat_maps[c] = le",
+    "",
+    "# Sanity check",
+    "n_obj_after = sum(train[c].dtype == object for c in train.columns if c.startswith('feat_'))",
+    "print(f'After encoding, object-typed feature columns: {n_obj_after}')",
+    "print('Sample row after encoding:')",
+    "try:",
+    "    display(train.head(2))",
+    "except NameError:",
+    "    print(train.head(2))",
+))
+
+# ---------- 3. EDA ----------
+cells.append(md("## 3. Exploratory Data Analysis (EDA)"))
+cells.append(code(
+    "feat_cols = [c for c in train.columns if c.startswith('feat_')]",
+    "print(f'#feature columns: {len(feat_cols)}')",
+    "",
+    "# 3.1 Target distribution",
+    "target_counts = train['TARGET'].value_counts().sort_index()",
+    "print('Target distribution:'); print(target_counts)",
+    "print(f'Class balance: 0 = {target_counts[0]/len(train)*100:.2f}%, 1 = {target_counts[1]/len(train)*100:.2f}%')",
+    "",
+    "fig, ax = plt.subplots(1, 2, figsize=(12, 4))",
+    "target_counts.plot(kind='bar', ax=ax[0], color=['#4C72B0', '#C44E52'])",
+    "for i, v in enumerate(target_counts.values): ax[0].text(i, v, f'{v:,}', ha='center', va='bottom')",
+    "ax[0].set_title('Target Distribution (counts)'); ax[0].set_xlabel('TARGET'); ax[0].set_ylabel('Count')",
+    "target_counts.plot(kind='pie', ax=ax[1], autopct='%1.2f%%', colors=['#4C72B0', '#C44E52'], startangle=90)",
+    "ax[1].set_title('Target Distribution (proportion)'); ax[1].set_ylabel('')",
+    "plt.tight_layout(); plt.show()",
+))
+
+cells.append(code(
+    "# 3.2 Missing values",
+    "miss_train = train[feat_cols].isna().mean().sort_values(ascending=False)",
+    "miss_test  = test[feat_cols].isna().mean().sort_values(ascending=False)",
+    "print('Train — top 10 missing (%):'); print((miss_train*100).head(10).round(3))",
+    "print('Test  — top 10 missing (%):'); print((miss_test*100).head(10).round(3))",
+    "print(f'\\n#features with NaN in train: {(miss_train>0).sum()}, all-NaN: {(miss_train==1).sum()}')",
+    "print(f'#features with NaN in test:  {(miss_test>0).sum()}, all-NaN: {(miss_test==1).sum()}')",
+))
+
+cells.append(code(
+    "# 3.3 Near-constant / constant features",
+    "nunique = train[feat_cols].nunique()",
+    "const_cols = nunique[nunique <= 1].index.tolist()",
+    "dominant = []",
+    "for c in feat_cols:",
+    "    if c in const_cols: continue",
+    "    if train[c].value_counts(normalize=True).iloc[0] >= 0.99:",
+    "        dominant.append(c)",
+    "print(f'#constant features (nunique ≤ 1): {len(const_cols)}')",
+    "print(f'#near-constant features (≥99% same value): {len(dominant)}')",
+    "",
+    "# 3.4 Top correlations with TARGET (sample for speed)",
+    "samp = train.sample(n=min(20000, len(train)), random_state=SEED)",
+    "corrs = samp[feat_cols + ['TARGET']].corr()['TARGET'].drop('TARGET').sort_values(key=lambda x: x.abs(), ascending=False)",
+    "top20 = corrs.head(20)",
+    "print('Top 20 |Pearson corr| with TARGET (sample):'); print(top20.round(4))",
+    "plt.figure(figsize=(8, 6))",
+    "sns.barplot(x=top20.values, y=top20.index, orient='h', palette='viridis')",
+    "plt.title('Top 20 |Pearson corr| with TARGET'); plt.xlabel('Pearson correlation'); plt.tight_layout(); plt.show()",
+))
+
+cells.append(code(
+    "# 3.5 Class-wise distributions for top features",
+    "top_feats = top20.index.tolist()[:6]",
+    "fig, axes = plt.subplots(2, 3, figsize=(15, 7))",
+    "for ax, c in zip(axes.flat, top_feats):",
+    "    for cls, col in [(0, '#4C72B0'), (1, '#C44E52')]:",
+    "        sub = samp.loc[samp['TARGET']==cls, c].dropna()",
+    "        if len(sub):",
+    "            lo, hi = np.percentile(sub, [0.5, 99.5])",
+    "            sub = sub[(sub >= lo) & (sub <= hi)]",
+    "        ax.hist(sub, bins=60, alpha=0.5, label=f'TARGET={cls}', color=col, density=True)",
+    "    ax.set_title(c); ax.legend()",
+    "plt.tight_layout(); plt.show()",
+))
+
+cells.append(code(
+    "# 3.6 Duplicate rows over feature columns",
+    "dup_train = train.duplicated(subset=feat_cols).sum()",
+    "dup_test  = test.duplicated(subset=feat_cols).sum()",
+    "print(f'Duplicate rows by features — train: {dup_train}, test: {dup_test}')",
+    "print('Feature dtypes:'); print(train[feat_cols].dtypes.value_counts())",
+))
+
+# ---------- 4. Preprocessing ----------
+cells.append(md(
+    "## 4. Preprocessing",
+    "",
+    "We produce **two views** of the data so the neural models get a clean signal while the GBDT models keep their preferred raw-ish input:",
+    "",
+    "- `X_gbdt` / `X_test_gbdt` — `float32`, constant columns dropped, median-imputed, **outlier-clipped** at 0.1% / 99.9%.",
+    "- `X_nn`   / `X_test_nn`    — same as above plus **quantile-transformed** to a Gaussian and **standardized** (robust to heavy tails).",
+    "",
+    "All statistics are computed on the **training fold only** for the cross-validation loops and on the full train for the final fit/test transforms.",
+))
+
+cells.append(code(
+    "GLOBAL_CONST = [c for c in feat_cols if train[c].nunique() <= 1]",
+    "KEEP_COLS = [c for c in feat_cols if c not in GLOBAL_CONST]",
+    "print(f'Kept {len(KEEP_COLS)} features after dropping {len(GLOBAL_CONST)} constant columns.')",
+    "",
+    "def fit_gbdt_view(train_df, test_df, cols=KEEP_COLS, q=(0.001, 0.999)):",
+    "    tr = train_df[cols].astype(np.float32).copy()",
+    "    te = test_df[cols].astype(np.float32).copy()",
+    "    med = tr.median()",
+    "    tr = tr.fillna(med); te = te.fillna(med)",
+    "    lo, hi = tr.quantile(q[0]), tr.quantile(q[1])",
+    "    tr = tr.clip(lo, hi, axis=1); te = te.clip(lo, hi, axis=1)",
+    "    return tr.values.astype(np.float32), te.values.astype(np.float32), med, lo, hi",
+    "",
+    "X_gbdt, X_test_gbdt, MED, LO, HI = fit_gbdt_view(train, test)",
+    "y = train['TARGET'].values.astype(np.int64)",
+    "test_ids = test['id'].values",
+    "print(f'X_gbdt: {X_gbdt.shape} | X_test_gbdt: {X_test_gbdt.shape} | y: {y.shape}')",
+    "print(f'NaNs remaining — train: {np.isnan(X_gbdt).sum()}, test: {np.isnan(X_test_gbdt).sum()}')",
+    "print(f'Class balance: {np.bincount(y)}')",
+    "",
+    "# CatBoost view: keep categorical columns as int and numeric columns as float32",
+    "# CatBoost refuses cat_features when given a numpy float array. We pass a DataFrame instead.",
+    "def fit_cat_view(train_df, test_df, cols=KEEP_COLS, cat_cols=obj_cols, q=(0.001, 0.999)):",
+    "    tr = pd.DataFrame(index=train_df.index)",
+    "    te = pd.DataFrame(index=test_df.index)",
+    "    for c in cols:",
+    "        if c in cat_cols:",
+    "            tr[c] = train_df[c].astype('int32')",
+    "            te[c] = test_df[c].astype('int32')",
+    "        else:",
+    "            v = train_df[c].astype(np.float32)",
+    "            med = v.median()",
+    "            v_clip = v.fillna(med).clip(v.quantile(q[0]), v.quantile(q[1]))",
+    "            tr[c] = v_clip.astype(np.float32)",
+    "            te[c] = test_df[c].astype(np.float32).fillna(med).clip(v.quantile(q[0]), v.quantile(q[1])).astype(np.float32)",
+    "    return tr, te",
+    "X_cat_df, X_test_cat_df = fit_cat_view(train, test)",
+    "print(f'X_cat_df (DataFrame for CatBoost): {X_cat_df.shape}  (cat-cols: {len(obj_cols)})  dtypes head: {X_cat_df.dtypes.head(10).tolist()}')",
+))
+
+cells.append(code(
+    "# 4.1 Neural view: quantile transform + standardize (fit on full train, since test is a forward pass)",
+    "QT = QuantileTransformer(output_distribution='normal', n_quantiles=2000, subsample=200000, random_state=SEED)",
+    "X_nn_full = QT.fit_transform(X_gbdt).astype(np.float32)",
+    "X_nn_test_full = QT.transform(X_test_gbdt).astype(np.float32)",
+    "SC = StandardScaler()",
+    "X_nn_full = SC.fit_transform(X_nn_full).astype(np.float32)",
+    "X_nn_test_full = SC.transform(X_nn_test_full).astype(np.float32)",
+    "print(f'X_nn: {X_nn_full.shape} | X_nn test: {X_nn_test_full.shape}  | mean≈{X_nn_full.mean():.3f}  std≈{X_nn_full.std():.3f}')",
+))
+
+# ---------- 5. Threshold helpers ----------
+cells.append(md(
+    "## 5. Macro F1 Threshold Tuning",
+    "",
+    "Macro F1 is sensitive to the threshold for the minority class. We sweep a fine grid on OOF probabilities and pick the threshold that maximizes macro F1. **Both** the global threshold and per-fold thresholds are computed to check consistency.",
+))
+
+cells.append(code(
+    "def best_threshold(y_true, y_prob, grid=None):",
+    "    if grid is None: grid = np.linspace(0.05, 0.95, 181)",
+    "    best_t, best_f1 = 0.5, -1.0",
+    "    for t in grid:",
+    "        f1 = f1_score(y_true, (y_prob >= t).astype(int), average='macro')",
+    "        if f1 > best_f1: best_f1, best_t = f1, t",
+    "    return best_t, best_f1",
+    "",
+    "def report_oof(y_true, y_prob, name='OOF'):",
+    "    auc = roc_auc_score(y_true, y_prob)",
+    "    t, f1m = best_threshold(y_true, y_prob)",
+    "    print(f'[{name}] AUC={auc:.5f} | best MacroF1={f1m:.5f} @ t={t:.3f}')",
+    "    print(classification_report(y_true, (y_prob >= t).astype(int), digits=4))",
+    "    return t, f1m, auc",
+))
+
+# ---------- 6. Common KFold ----------
+cells.append(code(
+    "skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)",
+    "folds = list(skf.split(X_gbdt, y))",
+    "print(f'Stratified {N_SPLITS}-fold splits: train sizes {[len(tr) for tr,_ in folds]}')",
+))
+
+# ---------- 7. LightGBM ----------
+cells.append(md("## 6. LightGBM × 3 Seeds (Stratified 5-Fold, Bagged)"))
+cells.append(code(
+    "# Identify categorical column indices inside KEEP_COLS for tree models",
+    "cat_indices = [i for i, c in enumerate(KEEP_COLS) if c in obj_cols]",
+    "print(f'LightGBM categorical indices: {cat_indices} -> {[KEEP_COLS[i] for i in cat_indices]}')",
+    "",
+    "def train_lgb_fold(Xtr, ytr, Xva, yva, Xte, seed, cat_idx):",
+    "    params = dict(",
+    "        objective='binary', metric=['auc', 'binary_logloss'],",
+    "        learning_rate=0.03, num_leaves=63, min_data_in_leaf=64,",
+    "        feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=5,",
+    "        lambda_l1=1.0, lambda_l2=1.0, max_depth=-1,",
+    "        verbosity=-1, seed=seed, num_threads=os.cpu_count(),",
+    "    )",
+    "    dtrain = lgb.Dataset(Xtr, ytr, categorical_feature=cat_idx if cat_idx else 'auto')",
+    "    dvalid = lgb.Dataset(Xva, yva, reference=dtrain, categorical_feature=cat_idx if cat_idx else 'auto')",
+    "    model = lgb.train(params, dtrain, num_boost_round=4000, valid_sets=[dvalid],",
+    "                      callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(0)])",
+    "    p_va = model.predict(Xva, num_iteration=model.best_iteration)",
+    "    p_te = model.predict(Xte, num_iteration=model.best_iteration)",
+    "    return p_va, p_te, model.best_iteration",
+    "",
+    "oof_lgb  = np.zeros(len(X_gbdt), dtype=np.float32)",
+    "test_lgb = np.zeros(len(X_test_gbdt), dtype=np.float32)",
+    "imp_lgb  = np.zeros(len(KEEP_COLS), dtype=np.float32)",
+    "for seed in SEEDS:",
+    "    for fold, (tr, va) in enumerate(folds):",
+    "        pv, pt, it = train_lgb_fold(X_gbdt[tr], y[tr], X_gbdt[va], y[va], X_test_gbdt, seed, cat_indices)",
+    "        oof_lgb[va]  += pv / len(SEEDS)",
+    "        test_lgb     += pt / (N_SPLITS * len(SEEDS))",
+    "        print(f'  seed={seed:>4} fold={fold+1}  best_iter={it}')",
+    "t_lgb, f1_lgb, auc_lgb = report_oof(y, oof_lgb, 'LightGBM (3-seed bag)')",
+))
+
+cells.append(code(
+    "# Top-30 LightGBM feature importance (gain) using the last seed's models",
+    "def collect_lgb_imp(seed):",
+    "    imp = np.zeros(len(KEEP_COLS), dtype=np.float32)",
+    "    for tr, va in folds:",
+    "        params = dict(objective='binary', metric='auc', learning_rate=0.03, num_leaves=63,",
+    "                      min_data_in_leaf=64, feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=5,",
+    "                      lambda_l1=1.0, lambda_l2=1.0, max_depth=-1, verbosity=-1, seed=seed)",
+    "        dtrain = lgb.Dataset(X_gbdt[tr], y[tr]); dvalid = lgb.Dataset(X_gbdt[va], y[va], reference=dtrain)",
+    "        m = lgb.train(params, dtrain, num_boost_round=4000, valid_sets=[dvalid],",
+    "                      callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(0)])",
+    "        imp += m.feature_importance(importance_type='gain')",
+    "    return imp / N_SPLITS",
+    "",
+    "imp = collect_lgb_imp(SEED)",
+    "imp_df = pd.DataFrame({'feature': KEEP_COLS, 'gain': imp}).sort_values('gain', ascending=False)",
+    "imp_df.head(30).plot(kind='barh', x='feature', y='gain', figsize=(8, 8), color='#4C72B0')",
+    "plt.gca().invert_yaxis(); plt.title('LightGBM — top 30 feature importance (gain)'); plt.tight_layout(); plt.show()",
+))
+
+# ---------- 8. XGBoost ----------
+cells.append(md("## 7. XGBoost × 3 Seeds (Stratified 5-Fold, Bagged)"))
+cells.append(code(
+    "def train_xgb_fold(Xtr, ytr, Xva, yva, Xte, seed):",
+    "    params = dict(",
+    "        objective='binary:logistic', eval_metric=['auc', 'logloss'],",
+    "        tree_method='hist', device='cuda' if torch.cuda.is_available() else 'cpu',",
+    "        learning_rate=0.03, max_depth=6, min_child_weight=4,",
+    "        subsample=0.8, colsample_bytree=0.7, reg_alpha=1.0, reg_lambda=2.0, gamma=0.0,",
+    "        seed=seed, n_jobs=os.cpu_count(),",
+    "    )",
+    "    dtr = xgb.DMatrix(Xtr, ytr); dva = xgb.DMatrix(Xva, yva); dte = xgb.DMatrix(Xte)",
+    "    m = xgb.train(params, dtr, num_boost_round=4000, evals=[(dva, 'va')],",
+    "                     early_stopping_rounds=200, verbose_eval=False)",
+    "    pv = m.predict(dva, iteration_range=(0, m.best_iteration + 1))",
+    "    pt = m.predict(dte, iteration_range=(0, m.best_iteration + 1))",
+    "    return pv, pt, m.best_iteration",
+    "",
+    "oof_xgb  = np.zeros(len(X_gbdt), dtype=np.float32)",
+    "test_xgb = np.zeros(len(X_test_gbdt), dtype=np.float32)",
+    "for seed in SEEDS:",
+    "    for fold, (tr, va) in enumerate(folds):",
+    "        pv, pt, it = train_xgb_fold(X_gbdt[tr], y[tr], X_gbdt[va], y[va], X_test_gbdt, seed)",
+    "        oof_xgb[va]  += pv / len(SEEDS)",
+    "        test_xgb     += pt / (N_SPLITS * len(SEEDS))",
+    "        print(f'  seed={seed:>4} fold={fold+1}  best_iter={it}')",
+    "t_xgb, f1_xgb, auc_xgb = report_oof(y, oof_xgb, 'XGBoost (3-seed bag)')",
+))
+
+# ---------- 9. CatBoost ----------
+cells.append(md("## 8. CatBoost × 3 Seeds (Stratified 5-Fold, Bagged)"))
+cells.append(code(
+    "# Identify the column indices of the categorical (originally object) features inside KEEP_COLS",
+    "cat_indices = [i for i, c in enumerate(KEEP_COLS) if c in obj_cols]",
+    "print(f'CatBoost will treat {len(cat_indices)} categorical columns: {[KEEP_COLS[i] for i in cat_indices]}')",
+    "",
+    "def train_cat_fold(Xtr_df, ytr, Xva_df, yva, Xte_df, seed, cat_idx):",
+    "    m = CatBoostClassifier(",
+    "        loss_function='Logloss', eval_metric='AUC',",
+    "        iterations=4000, learning_rate=0.05, depth=6, l2_leaf_reg=3.0,",
+    "        random_seed=seed, task_type='GPU' if torch.cuda.is_available() else 'CPU',",
+    "        verbose=False, early_stopping_rounds=200,",
+    "    )",
+    "    # Pass DataFrames so CatBoost keeps cat columns as int and the rest as float",
+    "    m.fit(Xtr_df, ytr, eval_set=(Xva_df, yva), cat_features=cat_idx, use_best_model=True, verbose=False)",
+    "    pv = m.predict_proba(Xva_df)[:, 1]; pt = m.predict_proba(Xte_df)[:, 1]",
+    "    return pv, pt, m.get_best_iteration()",
+    "",
+    "oof_cat  = np.zeros(len(X_cat_df), dtype=np.float32)",
+    "test_cat = np.zeros(len(X_test_cat_df), dtype=np.float32)",
+    "for seed in SEEDS:",
+    "    for fold, (tr, va) in enumerate(folds):",
+    "        Xtr_df = X_cat_df.iloc[tr].reset_index(drop=True)",
+    "        Xva_df = X_cat_df.iloc[va].reset_index(drop=True)",
+    "        Xte_df = X_test_cat_df.reset_index(drop=True)",
+    "        pv, pt, it = train_cat_fold(Xtr_df, y[tr], Xva_df, y[va], Xte_df, seed, cat_indices)",
+    "        oof_cat[va]  += pv / len(SEEDS)",
+    "        test_cat     += pt / (N_SPLITS * len(SEEDS))",
+    "        print(f'  seed={seed:>4} fold={fold+1}  best_iter={it}')",
+    "t_cat, f1_cat, auc_cat = report_oof(y, oof_cat, 'CatBoost (3-seed bag)')",
+))
+
+# ---------- 10. HistGradientBoosting ----------
+cells.append(md("## 9. HistGradientBoosting (sklearn)"))
+cells.append(code(
+    "oof_hgb  = np.zeros(len(X_gbdt), dtype=np.float32)",
+    "test_hgb = np.zeros(len(X_test_gbdt), dtype=np.float32)",
+    "for fold, (tr, va) in enumerate(folds):",
+    "    m = HistGradientBoostingClassifier(",
+    "        learning_rate=0.05, max_iter=2000, max_leaf_nodes=63, min_samples_leaf=64,",
+    "        l2_regularization=1.0, early_stopping=True, validation_fraction=0.15, n_iter_no_change=50,",
+    "        random_state=SEED,",
+    "    )",
+    "    m.fit(X_gbdt[tr], y[tr])",
+    "    oof_hgb[va] = m.predict_proba(X_gbdt[va])[:, 1]",
+    "    test_hgb += m.predict_proba(X_test_gbdt)[:, 1] / N_SPLITS",
+    "    print(f'  fold={fold+1}  n_iter={m.n_iter_}')",
+    "t_hgb, f1_hgb, auc_hgb = report_oof(y, oof_hgb, 'HistGradientBoosting')",
+))
+
+# ---------- 11. ExtraTrees ----------
+cells.append(md("## 10. ExtraTrees"))
+cells.append(code(
+    "oof_et  = np.zeros(len(X_gbdt), dtype=np.float32)",
+    "test_et = np.zeros(len(X_test_gbdt), dtype=np.float32)",
+    "for fold, (tr, va) in enumerate(folds):",
+    "    m = ExtraTreesClassifier(",
+    "        n_estimators=600, max_features='sqrt', min_samples_leaf=4,",
+    "        n_jobs=os.cpu_count(), random_state=SEED, bootstrap=False,",
+    "    )",
+    "    m.fit(X_gbdt[tr], y[tr])",
+    "    oof_et[va] = m.predict_proba(X_gbdt[va])[:, 1]",
+    "    test_et += m.predict_proba(X_test_gbdt)[:, 1] / N_SPLITS",
+    "    print(f'  fold={fold+1}  fit done')",
+    "t_et, f1_et, auc_et = report_oof(y, oof_et, 'ExtraTrees')",
+))
+
+# ---------- 12. RandomForest ----------
+cells.append(md("## 11. RandomForest"))
+cells.append(code(
+    "oof_rf  = np.zeros(len(X_gbdt), dtype=np.float32)",
+    "test_rf = np.zeros(len(X_test_gbdt), dtype=np.float32)",
+    "for fold, (tr, va) in enumerate(folds):",
+    "    m = RandomForestClassifier(",
+    "        n_estimators=600, max_features='sqrt', min_samples_leaf=4,",
+    "        n_jobs=os.cpu_count(), random_state=SEED, bootstrap=True,",
+    "    )",
+    "    m.fit(X_gbdt[tr], y[tr])",
+    "    oof_rf[va] = m.predict_proba(X_gbdt[va])[:, 1]",
+    "    test_rf += m.predict_proba(X_test_gbdt)[:, 1] / N_SPLITS",
+    "    print(f'  fold={fold+1}  fit done')",
+    "t_rf, f1_rf, auc_rf = report_oof(y, oof_rf, 'RandomForest')",
+))
+
+# ---------- 13. Logistic Regression ----------
+cells.append(md("## 12. Logistic Regression (linear baseline)"))
+cells.append(code(
+    "oof_lr  = np.zeros(len(X_gbdt), dtype=np.float32)",
+    "test_lr = np.zeros(len(X_test_gbdt), dtype=np.float32)",
+    "for fold, (tr, va) in enumerate(folds):",
+    "    imp = SimpleImputer(strategy='median')",
+    "    Xtr = imp.fit_transform(X_gbdt[tr]); Xva = imp.transform(X_gbdt[va]); Xte = imp.transform(X_test_gbdt)",
+    "    scaler = StandardScaler()",
+    "    Xtr = scaler.fit_transform(Xtr); Xva = scaler.transform(Xva); Xte = scaler.transform(Xte)",
+    "    m = LogisticRegression(C=0.5, penalty='l2', solver='lbfgs', max_iter=4000, n_jobs=os.cpu_count())",
+    "    m.fit(Xtr, y[tr])",
+    "    oof_lr[va] = m.predict_proba(Xva)[:, 1]",
+    "    test_lr += m.predict_proba(Xte)[:, 1] / N_SPLITS",
+    "    print(f'  fold={fold+1}  fit done')",
+    "t_lr, f1_lr, auc_lr = report_oof(y, oof_lr, 'LogisticRegression')",
+))
+
+# ---------- 14. ANN (MLP) ----------
+cells.append(md(
+    "## 13. ANN — MLP (50 epochs × 5 folds, with SWA)",
+    "",
+    "A 3-layer MLP with BatchNorm + Dropout, AdamW + cosine LR, BCE w/ `pos_weight`, **Stochastic Weight Averaging (SWA)** for the last 20 epochs, and early stopping on validation AUC.",
+))
+cells.append(code(
+    "class MLP(nn.Module):",
+    "    def __init__(self, in_dim, hidden=(512, 256, 128), dropout=0.3):",
+    "        super().__init__()",
+    "        layers = []",
+    "        d = in_dim",
+    "        for h in hidden:",
+    "            layers += [nn.Linear(d, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)]",
+    "            d = h",
+    "        layers += [nn.Linear(d, 1)]",
+    "        self.net = nn.Sequential(*layers)",
+    "    def forward(self, x): return self.net(x).squeeze(-1)",
+    "",
+    "def train_mlp_fold(Xtr, ytr, Xva, yva, Xte, seed, epochs=EPOCHS_ANN, batch_size=BATCH_ANN,",
+    "                   lr=1e-3, wd=1e-4, dropout=0.3, swa_start=30, verbose=False):",
+    "    set_seed(seed + 31)",
+    "    device = DEVICE",
+    "    model = MLP(Xtr.shape[1], hidden=(512, 256, 128), dropout=dropout).to(device)",
+    "    pos_w = torch.tensor([float((ytr == 0).sum() / max(1, (ytr == 1).sum()))], device=device)",
+    "    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)",
+    "    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)",
+    "    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=epochs)",
+    "    swa_model = AveragedModel(model).to(device)",
+    "    swa_sched = SWALR(optim, swa_lr=lr * 0.1)",
+    "    Xtr_t = torch.from_numpy(Xtr); ytr_t = torch.from_numpy(ytr.astype(np.float32))",
+    "    Xva_t = torch.from_numpy(Xva).to(device); yva_t = torch.from_numpy(yva.astype(np.float32)).to(device)",
+    "    Xte_t = torch.from_numpy(Xte).to(device)",
+    "    loader = DataLoader(TensorDataset(Xtr_t, ytr_t), batch_size=batch_size, shuffle=True, drop_last=False)",
+    "    best_auc, best_state, bad, patience = -1.0, None, 0, 8",
+    "    for epoch in range(epochs):",
+    "        model.train()",
+    "        for xb, yb in loader:",
+    "            xb = xb.to(device, non_blocking=True); yb = yb.to(device, non_blocking=True)",
+    "            optim.zero_grad()",
+    "            loss = loss_fn(model(xb), yb)",
+    "            loss.backward(); optim.step()",
+    "        if epoch + 1 >= swa_start:",
+    "            swa_model.update_parameters(model); swa_sched.step()",
+    "        else:",
+    "            sched.step()",
+    "        model.eval()",
+    "        with torch.no_grad():",
+    "            va_prob = torch.sigmoid(model(Xva_t)).cpu().numpy()",
+    "        va_auc = roc_auc_score(yva, va_prob)",
+    "        if verbose: print(f'    epoch {epoch+1:02d}  val AUC={va_auc:.5f}')",
+    "        if va_auc > best_auc + 1e-5:",
+    "            best_auc, best_state, bad = va_auc, {k: v.detach().clone() for k, v in model.state_dict().items()}, 0",
+    "        else:",
+    "            bad += 1",
+    "            if bad >= patience: break",
+    "    # Either best single model, or SWA-averaged model — pick by val AUC",
+    "    model.load_state_dict(best_state)",
+    "    model.eval()",
+    "    with torch.no_grad():",
+    "        va_b = torch.sigmoid(model(Xva_t)).cpu().numpy()",
+    "        te_b = torch.sigmoid(model(Xte_t)).cpu().numpy()",
+    "    swa_auc = -1",
+    "    if epochs >= swa_start:",
+    "        torch.optim.swa_utils.update_bn(loader, swa_model, device=device)",
+    "        swa_model.eval()",
+    "        with torch.no_grad():",
+    "            va_s = torch.sigmoid(swa_model(Xva_t)).cpu().numpy()",
+    "            te_s = torch.sigmoid(swa_model(Xte_t)).cpu().numpy()",
+    "        swa_auc = roc_auc_score(yva, va_s)",
+    "    if swa_auc > best_auc:",
+    "        print(f'    using SWA model (AUC={swa_auc:.5f} vs best={best_auc:.5f})')",
+    "        return va_s, te_s, swa_auc",
+    "    print(f'    using best single model (AUC={best_auc:.5f})')",
+    "    return va_b, te_b, best_auc",
+))
+
+cells.append(code(
+    "oof_mlp  = np.zeros(len(X_gbdt), dtype=np.float32)",
+    "test_mlp = np.zeros(len(X_test_gbdt), dtype=np.float32)",
+    "for fold, (tr, va) in enumerate(folds):",
+    "    pv, pt, va_auc = train_mlp_fold(X_nn_full[tr], y[tr], X_nn_full[va], y[va], X_nn_test_full, seed=SEED)",
+    "    oof_mlp[va] = pv",
+    "    test_mlp += pt / N_SPLITS",
+    "    print(f'  fold={fold+1}: AUC={va_auc:.5f}')",
+    "t_mlp, f1_mlp, auc_mlp = report_oof(y, oof_mlp, 'MLP (ANN)')",
+))
+
+# ---------- 15. 1D CNN (RNN-like) ----------
+cells.append(md(
+    "## 14. RNN-like — 1D CNN over feature tokens (50 epochs × 5 folds, with SWA)",
+    "",
+    "Treat the 350 features as a 1-D sequence of tokens, embed each into a `d_model` vector, then run a stack of 1-D convolutions + global pooling + an MLP head. This is a **CNN-as-RNN** style architecture that works well on tabular data with no time axis.",
+))
+cells.append(code(
+    "class TabularCNN(nn.Module):",
+    "    def __init__(self, in_features, embed_dim=24, dropout=0.3):",
+    "        super().__init__()",
+    "        # per-feature embedding: project each scalar into a small vector",
+    "        self.proj = nn.Linear(1, embed_dim)",
+    "        self.conv1 = nn.Conv1d(embed_dim, 128, kernel_size=5, padding=2)",
+    "        self.bn1   = nn.BatchNorm1d(128)",
+    "        self.conv2 = nn.Conv1d(128, 128, kernel_size=5, padding=2)",
+    "        self.bn2   = nn.BatchNorm1d(128)",
+    "        self.conv3 = nn.Conv1d(128, 64, kernel_size=3, padding=1)",
+    "        self.bn3   = nn.BatchNorm1d(64)",
+    "        self.drop  = nn.Dropout(dropout)",
+    "        self.head  = nn.Sequential(nn.Linear(64, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 1))",
+    "    def forward(self, x):",
+    "        # x: [B, F]  -> [B, F, 1] -> [B, F, E] -> [B, E, F]",
+    "        x = self.proj(x.unsqueeze(-1))",
+    "        x = x.transpose(1, 2)",
+    "        x = F.relu(self.bn1(self.conv1(x)))",
+    "        x = F.relu(self.bn2(self.conv2(x)))",
+    "        x = F.relu(self.bn3(self.conv3(x)))",
+    "        x = self.drop(x)",
+    "        # global pooling (like an RNN's last hidden state)",
+    "        x = x.mean(dim=2) + x.amax(dim=2) * 0.0  # mean pool over tokens",
+    "        return self.head(x).squeeze(-1)",
+    "",
+    "def train_cnn_fold(Xtr, ytr, Xva, yva, Xte, seed, epochs=EPOCHS_ANN, batch_size=BATCH_ANN,",
+    "                   lr=1e-3, wd=1e-4, dropout=0.3, swa_start=30, verbose=False):",
+    "    set_seed(seed + 71)",
+    "    device = DEVICE",
+    "    model = TabularCNN(Xtr.shape[1], embed_dim=24, dropout=dropout).to(device)",
+    "    pos_w = torch.tensor([float((ytr == 0).sum() / max(1, (ytr == 1).sum()))], device=device)",
+    "    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)",
+    "    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)",
+    "    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=epochs)",
+    "    swa_model = AveragedModel(model).to(device)",
+    "    swa_sched = SWALR(optim, swa_lr=lr * 0.1)",
+    "    Xtr_t = torch.from_numpy(Xtr); ytr_t = torch.from_numpy(ytr.astype(np.float32))",
+    "    Xva_t = torch.from_numpy(Xva).to(device); yva_t = torch.from_numpy(yva.astype(np.float32)).to(device)",
+    "    Xte_t = torch.from_numpy(Xte).to(device)",
+    "    loader = DataLoader(TensorDataset(Xtr_t, ytr_t), batch_size=batch_size, shuffle=True, drop_last=False)",
+    "    best_auc, best_state, bad, patience = -1.0, None, 0, 8",
+    "    for epoch in range(epochs):",
+    "        model.train()",
+    "        for xb, yb in loader:",
+    "            xb = xb.to(device, non_blocking=True); yb = yb.to(device, non_blocking=True)",
+    "            optim.zero_grad()",
+    "            loss = loss_fn(model(xb), yb)",
+    "            loss.backward(); optim.step()",
+    "        if epoch + 1 >= swa_start:",
+    "            swa_model.update_parameters(model); swa_sched.step()",
+    "        else: sched.step()",
+    "        model.eval()",
+    "        with torch.no_grad():",
+    "            va_prob = torch.sigmoid(model(Xva_t)).cpu().numpy()",
+    "        va_auc = roc_auc_score(yva, va_prob)",
+    "        if verbose: print(f'    epoch {epoch+1:02d}  val AUC={va_auc:.5f}')",
+    "        if va_auc > best_auc + 1e-5:",
+    "            best_auc, best_state, bad = va_auc, {k: v.detach().clone() for k, v in model.state_dict().items()}, 0",
+    "        else:",
+    "            bad += 1",
+    "            if bad >= patience: break",
+    "    model.load_state_dict(best_state); model.eval()",
+    "    with torch.no_grad():",
+    "        va_b = torch.sigmoid(model(Xva_t)).cpu().numpy()",
+    "        te_b = torch.sigmoid(model(Xte_t)).cpu().numpy()",
+    "    swa_auc = -1",
+    "    if epochs >= swa_start:",
+    "        torch.optim.swa_utils.update_bn(loader, swa_model, device=device)",
+    "        swa_model.eval()",
+    "        with torch.no_grad():",
+    "            va_s = torch.sigmoid(swa_model(Xva_t)).cpu().numpy()",
+    "            te_s = torch.sigmoid(swa_model(Xte_t)).cpu().numpy()",
+    "        swa_auc = roc_auc_score(yva, va_s)",
+    "    if swa_auc > best_auc:",
+    "        print(f'    using SWA model (AUC={swa_auc:.5f} vs best={best_auc:.5f})')",
+    "        return va_s, te_s, swa_auc",
+    "    print(f'    using best single model (AUC={best_auc:.5f})')",
+    "    return va_b, te_b, best_auc",
+))
+
+cells.append(code(
+    "oof_cnn  = np.zeros(len(X_gbdt), dtype=np.float32)",
+    "test_cnn = np.zeros(len(X_test_gbdt), dtype=np.float32)",
+    "for fold, (tr, va) in enumerate(folds):",
+    "    pv, pt, va_auc = train_cnn_fold(X_nn_full[tr], y[tr], X_nn_full[va], y[va], X_nn_test_full, seed=SEED)",
+    "    oof_cnn[va] = pv",
+    "    test_cnn += pt / N_SPLITS",
+    "    print(f'  fold={fold+1}: AUC={va_auc:.5f}')",
+    "t_cnn, f1_cnn, auc_cnn = report_oof(y, oof_cnn, 'TabularCNN (RNN-like)')",
+))
+
+# ---------- 16. Model Comparison ----------
+cells.append(md("## 15. Model Comparison"))
+cells.append(code(
+    "results = pd.DataFrame({",
+    "    'model':   ['LightGBM', 'XGBoost', 'CatBoost', 'HGB', 'ExtraTrees', 'RandomForest', 'LR', 'MLP', 'CNN'],",
+    "    'AUC':     [auc_lgb, auc_xgb, auc_cat, auc_hgb, auc_et, auc_rf, auc_lr, auc_mlp, auc_cnn],",
+    "    'MacroF1': [f1_lgb, f1_xgb, f1_cat, f1_hgb, f1_et, f1_rf, f1_lr, f1_mlp, f1_cnn],",
+    "    'thresh':  [t_lgb, t_xgb, t_cat, t_hgb, t_et, t_rf, t_lr, t_mlp, t_cnn],",
+    "}).sort_values('MacroF1', ascending=False).reset_index(drop=True)",
+    "print(results.to_string(index=False))",
+    "",
+    "models = ['LGB', 'XGB', 'CAT', 'HGB', 'ET', 'RF', 'LR', 'MLP', 'CNN']",
+    "oofs  = [oof_lgb,  oof_xgb,  oof_cat,  oof_hgb,  oof_et,  oof_rf,  oof_lr,  oof_mlp,  oof_cnn]",
+    "tests = [test_lgb, test_xgb, test_cat, test_hgb, test_et, test_rf, test_lr, test_mlp, test_cnn]",
+))
+
+# ---------- 17. Stacking + rank-blend ----------
+cells.append(md(
+    "## 16. Ensembling — Rank Average + Stacked Meta-Learner",
+    "",
+    "Two complementary blends:",
+    "",
+    "1. **Rank-average** of all base predictors (robust to scale).",
+    "2. **Stacked Logistic Regression** on the OOF probability matrix — trained with another Stratified 5-Fold to avoid leakage.",
+    "",
+    "We compare them on OOF Macro F1 and pick the best for the final submission.",
+))
+
+cells.append(code(
+    "from scipy.stats import rankdata",
+    "def rank01(x): r = rankdata(x, method='average'); return (r - 1) / (len(r) - 1)",
+    "",
+    "oof_ranks  = np.column_stack([rank01(o) for o in oofs])",
+    "test_ranks = np.column_stack([rank01(t) for t in tests])",
+    "",
+    "# 16.1 Rank average — all models",
+    "oof_ra_all = oof_ranks.mean(axis=1); test_ra_all = test_ranks.mean(axis=1)",
+    "t_ra_all, f1_ra_all, auc_ra_all = report_oof(y, oof_ra_all, 'Rank-Avg (all 9)')",
+    "",
+    "# 16.2 Rank average — only top-3 GBDT (LGB, XGB, CAT) + best NN (CNN or MLP)",
+    "top_nn_idx = np.argmax([auc_mlp, auc_cnn]) + 7  # 7=MLP, 8=CNN",
+    "idx = [0, 1, 2, top_nn_idx]",
+    "oof_ra_strong = oof_ranks[:, idx].mean(axis=1); test_ra_strong = test_ranks[:, idx].mean(axis=1)",
+    "t_ra_strong, f1_ra_strong, auc_ra_strong = report_oof(y, oof_ra_strong, f'Rank-Avg (LGB+XGB+CAT+{models[top_nn_idx]})')",
+))
+
+cells.append(code(
+    "# 16.3 Stacked Logistic Regression on OOF probabilities (with internal 5-fold CV to avoid leakage)",
+    "P_oof = np.column_stack(oofs)        # shape (N, 9)",
+    "P_te  = np.column_stack(tests)       # shape (N_te, 9)",
+    "print('Stacker input OOF shape:', P_oof.shape, '  test shape:', P_te.shape)",
+    "",
+    "oof_meta = np.zeros(len(y), dtype=np.float32)",
+    "test_meta = np.zeros(len(test_ids), dtype=np.float32)",
+    "skf_meta = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED + 1)",
+    "for fold, (tr, va) in enumerate(skf_meta.split(P_oof, y)):",
+    "    m = LogisticRegression(C=2.0, penalty='l2', solver='lbfgs', max_iter=4000)",
+    "    m.fit(P_oof[tr], y[tr])",
+    "    oof_meta[va] = m.predict_proba(P_oof[va])[:, 1]",
+    "    test_meta += m.predict_proba(P_te)[:, 1] / 5",
+    "    print(f'  meta fold={fold+1}  coefs abs sum={np.abs(m.coef_[0]).sum():.3f}')",
+    "t_meta, f1_meta, auc_meta = report_oof(y, oof_meta, 'Stacked Logistic Regression')",
+))
+
+cells.append(code(
+    "# 16.4 Choose the best blend for the final submission",
+    "candidates = {",
+    "    'Rank-Avg (all 9)':           (oof_ra_all,    test_ra_all,    t_ra_all,    f1_ra_all),",
+    "    'Rank-Avg (LGB+XGB+CAT+NN)':  (oof_ra_strong, test_ra_strong, t_ra_strong, f1_ra_strong),",
+    "    'Stacked LogReg':             (oof_meta,      test_meta,      t_meta,      f1_meta),",
+    "}",
+    "best_name, best_tuple = max(candidates.items(), key=lambda kv: kv[1][3])",
+    "oof_final, test_final, t_final, f1_final = best_tuple",
+    "print(f'\\n>> Best blender: {best_name} | OOF MacroF1={f1_final:.5f} @ threshold={t_final:.3f}')",
+))
+
+# ---------- 18. Submission ----------
+cells.append(md("## 17. Final Submission"))
+cells.append(code(
+    "final_pred = (test_final >= t_final).astype(int)",
+    "print(f'Final threshold: {t_final:.3f}'); print(f'Predicted class distribution: {np.bincount(final_pred)}')",
+    "",
+    "sub = pd.DataFrame({'id': test_ids, 'TARGET': final_pred})",
+    "sub = sample_sub[['id']].merge(sub, on='id', how='left')",
+    "assert sub['TARGET'].notna().all(), 'Missing predictions for some test ids!'",
+    "sub['TARGET'] = sub['TARGET'].astype(int)",
+    "out_path = os.path.join(OUT_DIR, 'submission.csv')",
+    "sub.to_csv(out_path, index=False)",
+    "print(f'Saved: {out_path}  shape={sub.shape}')",
+    "print(sub.head())",
+))
+
+cells.append(code(
+    "# Save all OOF / test predictions for later analysis",
+    "np.savez(os.path.join(OUT_DIR, 'oof_and_test.npz'),",
+    "         oof_lgb=oof_lgb, oof_xgb=oof_xgb, oof_cat=oof_cat,",
+    "         oof_hgb=oof_hgb, oof_et=oof_et, oof_rf=oof_rf, oof_lr=oof_lr,",
+    "         oof_mlp=oof_mlp, oof_cnn=oof_cnn,",
+    "         test_lgb=test_lgb, test_xgb=test_xgb, test_cat=test_cat,",
+    "         test_hgb=test_hgb, test_et=test_et, test_rf=test_rf, test_lr=test_lr,",
+    "         test_mlp=test_mlp, test_cnn=test_cnn,",
+    "         oof_final=oof_final, test_final=test_final, threshold=t_final)",
+    "print('Saved oof_and_test.npz')",
+))
+
+# ---------- 19. Summary ----------
+cells.append(md(
+    "## 18. Summary",
+    "",
+    "**What the pipeline does**",
+    "",
+    "1. **EDA** — class imbalance (~6%), thousands of NaN cells, some near-constant columns, weak but non-zero linear correlations with target.",
+    "2. **Preprocessing** — drop constant columns, median-impute, clip outliers to 0.1% / 99.9%; additionally quantile-transform + standardize for the neural networks.",
+    "3. **9 base learners** — LightGBM, XGBoost, CatBoost (each bagged across 3 seeds × 5 folds = 15 sub-models), HistGradientBoosting, ExtraTrees, RandomForest, Logistic Regression, MLP (ANN), and a 1-D CNN (RNN-like) over feature tokens. All ANNs run for **50 epochs × 5 folds with SWA** for the last 20 epochs.",
+    "4. **Ensembling** — rank-average of all 9 predictors, plus a **stacked Logistic Regression** meta-learner on OOF probabilities. We pick whichever has the best OOF Macro F1.",
+    "5. **Threshold** — tuned on OOF probabilities to maximize Macro F1.",
+    "6. **Submission** — ordered as `sample_submission.csv` and saved to `submission.csv`.",
+    "",
+    "**Suggested next steps to push accuracy further**",
+    "",
+    "- **More seeds** for the GBDT models (e.g. `SEEDS = [42, 1024, 2025, 7, 99]`) — typically +0.001–0.003 Macro F1.",
+    "- **Feature engineering** — PCA components, KMeans cluster IDs, statistics over feature groups (e.g. sums of `feat_*` blocks).",
+    "- **Pseudo-labeling** on high-confidence test rows (≤ 0.05 or ≥ 0.95) — re-train one round.",
+    "- **LightGBM dart mode** + larger `num_iterations` for a different inductive bias.",
+    "- **TabNet / FT-Transformer** if you want a state-of-the-art tabular DNN (swap in for MLP/CNN).",
+    "- **Increase N_SPLITS** to 10 for tighter OOF estimates at the cost of 2× training time.",
+))
+
+# ---------- assemble ----------
+nb = {
+    "cells": cells,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "version": "3.10"},
+        "accelerator": "GPU",
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
+
+NB_PATH.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
+print(f"Wrote {NB_PATH}  cells={len(cells)}")
