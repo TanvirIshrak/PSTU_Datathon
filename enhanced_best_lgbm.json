@@ -1,0 +1,7 @@
+{
+  "best_threshold": 0.25,
+  "best_macro_f1": 0.6228377053610504,
+  "oof_auc": 0.8217618937749667,
+  "n_features": 100,
+  "mean_iters": 86
+}

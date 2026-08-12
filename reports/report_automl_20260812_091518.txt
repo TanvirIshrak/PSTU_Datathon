@@ -1,0 +1,73 @@
+======================================================================
+  CARNIVAL — AutoML Report (notebook-automl.ipynb)
+======================================================================
+  Generated  : 2026-08-12 09:15:18
+  Submission : submissions\submission_automl_20260812_091518.csv
+
+----------------------------------------------------------------------
+  AUTOML CONFIGURATION
+----------------------------------------------------------------------
+  FLAML version : 2.6.0
+  FLAML budget  : 45 min
+  AutoGluon     : not installed
+  AG budget     : 60 min  (if ran)
+  CV folds      : 5
+
+----------------------------------------------------------------------
+  FEATURE ENGINEERING
+----------------------------------------------------------------------
+  Smoothed target encoding for 6 categorical features
+  13 row-level statistical features added
+  Zero-variance features dropped
+  Final feature count: 341
+
+----------------------------------------------------------------------
+  MODEL COMPARISON
+----------------------------------------------------------------------
+  Model             Macro F1  Threshold
+  ----------------------------------------
+  flaml               0.6822      0.605
+
+----------------------------------------------------------------------
+  FINAL MODEL
+----------------------------------------------------------------------
+  Selected  : flaml
+  Threshold : 0.605  (F1-optimal)
+  Macro F1  : 0.6822
+  ROC-AUC   : 0.9398
+  PR-AUC    : 0.5199
+
+  Confusion Matrix (OOF):
+    True\Pred  |  Stable   | At-Risk
+    Stable     |    66,937 |   6,075
+    At-Risk    |       650 |   2,358
+
+  Classification Report:
+                precision    recall  f1-score   support
+  
+        Stable       0.99      0.92      0.95     73012
+       At-Risk       0.28      0.78      0.41      3008
+  
+      accuracy                           0.91     76020
+     macro avg       0.63      0.85      0.68     76020
+  weighted avg       0.96      0.91      0.93     76020
+  
+
+----------------------------------------------------------------------
+  SUBMISSION
+----------------------------------------------------------------------
+  Class 0  : 54,746
+  Class 1  : 5,908
+
+----------------------------------------------------------------------
+  FUTURE IMPROVEMENTS
+----------------------------------------------------------------------
+  • Increase FLAML time_budget to 2–4 hours for deeper search
+  • Install AutoGluon for full 2-level stacking ensemble
+  • Combine AutoML OOF probs with custom notebook-stack.ipynb probs
+  • Use AutoGluon feature importance to prune weak features
+  • Try AutoGluon "high_quality" preset for faster iteration
+
+======================================================================
+  END OF REPORT
+======================================================================
